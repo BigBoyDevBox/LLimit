@@ -44,6 +44,16 @@ final class AppModel: ObservableObject {
   /// was (or wasn't) found — including the macOS Keychain result for Claude.
   @Published var discoveryDiagnostics: [String] = []
 
+  @Published var claudeTerminalSession: ClaudeTerminalSession?
+  @Published private(set) var claudeAccountMessages: [String: String] = [:]
+  @Published private var claudeRenewals: [String: UUID] = [:]
+  private var claudeSessions: [String: ClaudeTerminalSession] = [:]
+  private var claudeLoginProfiles: [String: ClaudeCodeProfile] = [:]
+  private var claudeCredentialFailures: Set<String> = []
+  private var claudeUsageReceipts: [String: ClaudeCodeUsageReceipt] = [:]
+  private let claudeProfiles = ClaudeProfileService()
+  private let claudeProcess = ClaudeCodeProcess()
+
   private let settingsStore: SettingsStore
   private let snapshotStore: SnapshotStore
   private let historyStore: QuotaHistoryStore
@@ -164,26 +174,37 @@ final class AppModel: ObservableObject {
     defer { isRefreshing = false }
 
     await refreshExpiringChatGPTTokens()
-    refreshLiveClaudeTokens()
+    let claudeFailures = await prepareClaudeAccounts()
     reloadAccountStatuses()
 
     let enabledConfigs = runtimeConfigurations().filter { configuration in
       configuration.isEnabled && configuration.provider.hasRequiredCredentials(configuration.credentials)
+        && !claudeFailures.contains(where: { $0.accountID == configuration.accountID })
     }
 
-    guard !enabledConfigs.isEmpty else {
+    guard !enabledConfigs.isEmpty || !claudeFailures.isEmpty else {
       statusMessage = "No enabled provider accounts with complete credentials configured."
       return
     }
 
     do {
-      var refreshed = try await refreshService.refresh(configurations: enabledConfigs)
+      var refreshed = try await refreshService.refresh(configurations: enabledConfigs, credentialFailures: claudeFailures)
+      recordClaudeUsage(in: refreshed, configurations: enabledConfigs)
 
       // Reactive recovery: if an enabled OpenAI account failed authentication (a token
       // revoked before its JWT exp, or a Codex rotation that landed mid-cycle), refresh
       // its token and retry — only the accounts we actually recovered, so healthy accounts
       // and the other providers aren't re-polled (Anthropic hard-rate-limits repeat pollers).
-      let recoveredIDs = await recoverFailedOpenAITokens(in: refreshed)
+      var recoveredIDs = await recoverFailedOpenAITokens(in: refreshed)
+      let blockedClaudeIDs = Set(claudeFailures.map(\.accountID))
+      for failure in refreshed.failures where failure.provider == .anthropic && failure.kind == .auth
+        && !blockedClaudeIDs.contains(failure.accountID) {
+        if await prepareClaudeAccount(id: failure.accountID, force: true) == nil,
+           let account = account(withID: failure.accountID),
+           ClaudeCodeProfile.profile(from: account.credentials) != nil {
+          recoveredIDs.insert(failure.accountID)
+        }
+      }
       if !recoveredIDs.isEmpty {
         let retryConfigs = runtimeConfigurations().filter { configuration in
           recoveredIDs.contains(configuration.accountID)
@@ -196,42 +217,107 @@ final class AppModel: ObservableObject {
           // keeps the last-known usage, then splice only these accounts' results back in.
           let retrySnapshot = await refreshService.fetch(configurations: retryConfigs)
             .mergingStaleUsage(from: refreshed)
+          recordClaudeUsage(in: retrySnapshot, configurations: retryConfigs)
           refreshed = refreshed.replacingResults(forAccountIDs: retriedIDs, from: retrySnapshot)
           try? refreshService.save(refreshed)
         }
       }
 
-      do {
-        try historyStore.append(refreshed)
-      } catch {
-        print("[LLimit] Local history append failed: \(error.localizedDescription)")
-      }
-      reloadRecentHistory()
-
-      let widgetSyncReady = syncSnapshotToWidgetStore(refreshed)
-      let historySyncReady = syncHistoryToWidgetStore(refreshed)
-
-      if widgetSyncReady || historySyncReady {
-        reloadWidgetTimelines()
-      }
-
-      snapshot = refreshed
-
-      if widgetSyncReady && historySyncReady {
-        statusMessage = "Refreshed \(refreshed.providers.count) account(s), \(refreshed.failures.count) failure(s)"
-      } else {
-        statusMessage = "Refreshed \(refreshed.providers.count) account(s), \(refreshed.failures.count) failure(s). Widget sync partially unavailable."
-      }
+      publishSnapshot(refreshed)
     } catch {
       statusMessage = "Refresh failed: \(error.localizedDescription)"
     }
   }
 
+  private func publishSnapshot(_ refreshed: QuotaSnapshot) {
+    do {
+      try historyStore.append(refreshed)
+    } catch {
+      print("[LLimit] Local history append failed: \(error.localizedDescription)")
+    }
+    reloadRecentHistory()
+
+    let widgetSyncReady = syncSnapshotToWidgetStore(refreshed)
+    let historySyncReady = syncHistoryToWidgetStore(refreshed)
+
+    if widgetSyncReady || historySyncReady {
+      reloadWidgetTimelines()
+    }
+
+    snapshot = refreshed
+
+    if widgetSyncReady && historySyncReady {
+      statusMessage = "Refreshed \(refreshed.providers.count) account(s), \(refreshed.failures.count) failure(s)"
+    } else {
+      statusMessage = "Refreshed \(refreshed.providers.count) account(s), \(refreshed.failures.count) failure(s). Widget sync partially unavailable."
+    }
+  }
+
+  /// Bind each successful result to the profile actually queried. A timestamp
+  /// alone cannot distinguish an old imported login from its replacement.
+  private func recordClaudeUsage(in result: QuotaSnapshot, configurations: [ProviderRuntimeConfiguration]) {
+    for configuration in configurations where configuration.provider == .anthropic {
+      let id = configuration.accountID
+      guard !result.failures.contains(where: { $0.accountID == id }),
+            let usage = result.providers.first(where: { $0.accountID == id }),
+            let profile = ClaudeCodeProfile.profile(from: configuration.credentials) else {
+        claudeUsageReceipts[id] = nil
+        continue
+      }
+      claudeUsageReceipts[id] = ClaudeCodeUsageReceipt(profileID: profile.id, fetchedAt: usage.fetchedAt)
+    }
+  }
+
+  /// A completed login needs fresh usage. Reuse a concurrent cycle's successful
+  /// result only if it queried this new profile after login completed.
+  private func refreshClaudeAccountAfterCurrentCycle(_ id: String, requestedAt: Date) async {
+    while isRefreshing {
+      do { try await Task.sleep(for: .seconds(1)) }
+      catch { return }
+    }
+    guard !Task.isCancelled else { return }
+    guard let account = account(withID: id), account.isEnabled,
+          let profile = ClaudeCodeProfile.profile(from: account.credentials) else { return }
+    if snapshot?.failures.contains(where: { $0.accountID == id }) == false,
+       claudeUsageReceipts[id]?.satisfies(profileID: profile.id, since: requestedAt) == true {
+      return
+    }
+    isRefreshing = true
+    defer { isRefreshing = false }
+    let failure = await prepareClaudeAccount(id: id)
+    var partial: QuotaSnapshot
+    if let failure {
+      partial = QuotaSnapshot(generatedAt: Date(), providers: [], failures: [failure])
+    } else {
+      let configurations = runtimeConfigurations().filter { $0.accountID == id && $0.isEnabled }
+      partial = await refreshService.fetch(configurations: configurations)
+      recordClaudeUsage(in: partial, configurations: configurations)
+    }
+    partial = partial.mergingStaleUsage(from: snapshot)
+    var refreshed = snapshot?.replacingResults(forAccountIDs: [id], from: partial) ?? partial
+    refreshed.generatedAt = partial.generatedAt
+    var saveFailed = false
+    do { try refreshService.save(refreshed) }
+    catch { saveFailed = true }
+    publishSnapshot(refreshed)
+    if saveFailed { statusMessage = "The Claude refresh result could not be saved locally. Check LLimit’s storage permissions." }
+  }
+
   func reloadAccountStatuses() {
     accountStatuses = providerAccounts.map { account in
       let missing = account.missingCredentialLabels
+      let failed = claudeCredentialFailures.contains(account.id)
+      let pending = account.credentials[CredentialField.anthropicRenewalPending] != nil
+      let needsRenewal = ClaudeCodeProfile.profile(from: account.credentials) != nil
+        && ClaudeCodeProfile.readiness(for: ClaudeCodeProfile.credentials(from: account.credentials)) != .ready
       let detail: String
-      if missing.isEmpty {
+      if failed, let message = claudeAccountMessages[account.id] {
+        detail = message
+      } else if pending {
+        detail = "Renewal needs verification. Reconnect if it does not finish."
+      } else if needsRenewal {
+        detail = "Credentials need renewal. Refresh this account."
+      } else if missing.isEmpty {
         detail = account.isEnabled ? "Ready" : "Disabled"
       } else {
         detail = "Missing: \(missing.joined(separator: ", "))"
@@ -240,7 +326,7 @@ final class AppModel: ObservableObject {
       return ProviderAccountStatus(
         accountID: account.id,
         provider: account.provider,
-        available: missing.isEmpty,
+        available: missing.isEmpty && !failed && !pending && !needsRenewal,
         enabled: account.isEnabled,
         detail: detail
       )
@@ -268,16 +354,45 @@ final class AppModel: ObservableObject {
   }
 
   func removeProviderAccount(accountID: String) {
-    let removedAccount = providerAccounts.first { $0.id == accountID }
-    providerAccounts.removeAll { $0.id == accountID }
+    guard !isRefreshing, !claudeAccountIsBusy(accountID),
+          let removedAccount = account(withID: accountID) else { return }
+    var updated = currentSettings()
+    updated.accounts.removeAll { $0.id == accountID }
+    updated.providerStyleSettings.removeAll { $0.accountID == accountID }
+    updated.providerTileSlots = updated.providerTileSlots.map { $0 == accountID ? "" : $0 }
+    let outcome: ClaudeCodeProfileRetirement.Outcome
+    do {
+      guard !configurationLoadFailed else { throw ClaudeProfileService.Failure.settingsUnavailable }
+      let profile = ClaudeCodeProfile.profile(from: removedAccount.credentials)
+      outcome = try ClaudeCodeProfileRetirement.commit(
+        stored: removedAccount.credentials,
+        refreshLocked: profile.map { claudeProfiles.isRefreshLocked($0) } ?? false,
+        retain: { try claudeProfiles.retain($0) },
+        commitAccountChange: { try settingsStore.save(updated) },
+        deleteProfile: { try claudeProfiles.remove($0) })
+    } catch {
+      let message = "Could not remove this account safely. Check LLimit’s storage permissions and try again."
+      claudeAccountMessages[accountID] = message
+      statusMessage = message
+      reloadAccountStatuses()
+      return
+    }
+    claudeSessions[accountID] = nil
+    claudeAccountMessages[accountID] = nil
+    claudeCredentialFailures.remove(accountID)
+    claudeUsageReceipts[accountID] = nil
+    providerAccounts = updated.accounts
     providerStyleSettings.removeValue(forKey: accountID)
     // Deleting the account is an explicit choice, so its tile slots fall back to
     // automatic (visibly badged on the tile) instead of a dead "reassign" state.
-    providerTileSlots = providerTileSlots.map { $0 == accountID ? "" : $0 }
+    providerTileSlots = updated.providerTileSlots
     reconcileSnapshotWithCurrentAccounts()
     purgeHistory(for: removedAccount)
     reloadAccountStatuses()
-    saveConfiguration(showSuccessMessage: true)
+    if syncSettingsToWidgetStore(updated.redactedCredentials()) { reloadWidgetTimelines() }
+    statusMessage = outcome == .retained
+      ? "Account removed. Local Claude login cleanup is pending; credentials may still be stored on this Mac."
+      : "Account removed."
   }
 
   // MARK: - Detect & import (convenience)
@@ -326,6 +441,8 @@ final class AppModel: ObservableObject {
     }
 
     providerAccounts[index].credentials = match.credentials
+    claudeAccountMessages[accountID] = nil
+    claudeCredentialFailures.remove(accountID)
     reloadAccountStatuses()
     saveConfiguration()
     statusMessage = "Filled “\(providerAccounts[index].resolvedDisplayName)” from \(match.sourceLabel)."
@@ -367,55 +484,23 @@ final class AppModel: ObservableObject {
 
   #if canImport(Security)
   private static func readClaudeKeychainToken() -> (token: String?, diagnostic: String) {
-    // 1. Enumerate generic-password *attributes* (no data) — this does NOT trigger an
-    //    ACL permission prompt, and lets us find Claude's item even if it's stored
-    //    under a service name other than the documented "Claude Code-credentials"
-    //    (e.g. a newer CLI or the desktop app variant).
-    let listQuery: [String: Any] = [
+    // Import only the ordinary CLI login. Enumerating every service containing
+    // "claude" would expose a private managed profile as an unrelated import.
+    let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
-      kSecMatchLimit as String: kSecMatchLimitAll,
-      kSecReturnAttributes as String: true
+      kSecAttrService as String: "Claude Code-credentials",
+      kSecReturnData as String: true,
+      kSecMatchLimit as String: kSecMatchLimitOne
     ]
-    var listResult: CFTypeRef?
-    let listStatus = SecItemCopyMatching(listQuery as CFDictionary, &listResult)
-
-    var services: [String] = []
-    if listStatus == errSecSuccess, let items = listResult as? [[String: Any]] {
-      services = items.compactMap { $0[kSecAttrService as String] as? String }
+    var data: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &data)
+    if status == errSecSuccess, let payload = data as? Data, let token = claudeToken(fromKeychainData: payload) {
+      return (token, "found the default Claude Code login")
     }
-    let claudeServices = services.filter { $0.lowercased().contains("claude") }
-
-    // Try the documented service first, then any service mentioning "claude".
-    var candidates: [String] = ["Claude Code-credentials"]
-    for service in claudeServices where !candidates.contains(service) {
-      candidates.append(service)
+    if status == errSecInteractionNotAllowed {
+      return (nil, "the default Claude Code login needs Keychain permission. Allow access, then scan again.")
     }
-
-    for service in candidates {
-      let readQuery: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-        kSecReturnData as String: true,
-        kSecMatchLimit as String: kSecMatchLimitOne
-      ]
-      var data: CFTypeRef?
-      let status = SecItemCopyMatching(readQuery as CFDictionary, &data)
-
-      if status == errSecSuccess, let payload = data as? Data, let token = claudeToken(fromKeychainData: payload) {
-        return (token, "found token in “\(service)”")
-      }
-      if status == errSecInteractionNotAllowed {
-        return (nil, "“\(service)” exists but needs Keychain permission — click Allow, then Scan again [\(status)]")
-      }
-    }
-
-    if claudeServices.isEmpty {
-      let summary = services.isEmpty
-        ? "no generic-password items were visible"
-        : "scanned \(services.count) keychain items, none mention ‘claude’"
-      return (nil, "no Claude item in Keychain (\(summary)). Sign in with Claude Code, then scan again.")
-    }
-    return (nil, "Claude Keychain item(s) found (\(claudeServices.joined(separator: ", "))) but no readable token")
+    return (nil, "no readable default Claude Code login. Use Connect Claude to sign in to a separate account.")
   }
 
   /// Claude Code stores JSON (`{ "claudeAiOauth": { "accessToken": ... } }`), but be
@@ -566,55 +651,226 @@ final class AppModel: ObservableObject {
     return recovered
   }
 
-  /// Claude Code refreshes its own OAuth token (in `~/.claude/.credentials.json` and the
-  /// macOS Keychain) roughly every 8 hours. LLimit imports a one-time *copy* of that token,
-  /// so the copy goes stale and every fetch 401s ("Sign in again with Claude Code") within
-  /// hours — even though Claude Code itself keeps working. Before refreshing, re-read the
-  /// user's *live* local Claude token and adopt it for enabled Claude accounts if it changed.
-  ///
-  /// LLimit performs no OAuth exchange of its own here: it simply re-reads a credential the
-  /// user already has locally. To avoid clobbering a hand-entered token, only accounts whose
-  /// stored token is empty or is itself a Claude Code OAuth token (`sk-ant-oat…`) are updated.
-  private func refreshLiveClaudeTokens() {
-    let claudeAccountIDs = providerAccounts
-      .filter { $0.provider == .anthropic && $0.isEnabled }
-      .map(\.id)
-    guard !claudeAccountIDs.isEmpty else { return }
+  // MARK: - Independent Claude Code profiles
 
-    guard let liveToken = Self.currentLocalClaudeToken(), !liveToken.isEmpty else { return }
+  func claudeLoginIsOpen(_ accountID: String) -> Bool {
+    guard let session = claudeSessions[accountID] else { return false }
+    if case .exited = session.state { return false }
+    return true
+  }
 
-    var didChange = false
-    for accountID in claudeAccountIDs {
-      guard let index = providerAccounts.firstIndex(where: { $0.id == accountID }) else { continue }
-      let stored = providerAccounts[index].credentials[CredentialField.anthropicAccessToken] ?? ""
-      let isClaudeCodeToken = stored.isEmpty || stored.hasPrefix("sk-ant-oat")
-      if isClaudeCodeToken, stored != liveToken {
-        providerAccounts[index].credentials[CredentialField.anthropicAccessToken] = liveToken
-        didChange = true
+  func claudeAccountIsBusy(_ accountID: String) -> Bool {
+    if claudeRenewals[accountID] != nil { return true }
+    guard let session = claudeSessions[accountID] else { return false }
+    if case .exited = session.state { return false }
+    return true
+  }
+
+  func claudeRemovalRetainsLogin(_ accountID: String) -> Bool {
+    guard let account = account(withID: accountID),
+          let profile = ClaudeCodeProfile.profile(from: account.credentials) else { return false }
+    return account.credentials[CredentialField.anthropicRenewalPending] != nil
+      || claudeProfiles.isRefreshLocked(profile)
+  }
+
+  func dismissClaudeTerminal() {
+    if let session = claudeTerminalSession, case .exited = session.state {
+      claudeSessions = claudeSessions.filter { $0.value.id != session.id }
+    }
+    claudeTerminalSession = nil
+  }
+
+  func connectClaudeAccount(_ accountID: String) {
+    if let session = claudeSessions[accountID] {
+      if case .exited = session.state {} else {
+        claudeTerminalSession = session
+        return
       }
     }
-
-    if didChange {
-      saveConfiguration()
+    guard !isRefreshing, !claudeAccountIsBusy(accountID),
+          let account = account(withID: accountID), account.provider == .anthropic else { return }
+    do {
+      let executable = try claudeProfiles.executable()
+      // Stage each login independently. Cancellation or signing into the wrong
+      // account must leave an existing working connection untouched. This also
+      // avoids racing a renewal left behind by an earlier app instance.
+      let profile = ClaudeCodeProfile()
+      let directory = try claudeProfiles.prepare(profile)
+      let session = ClaudeTerminalSession(
+        executable: executable, arguments: ["auth", "login", "--claudeai"],
+        environment: ClaudeCodeProcess.environment(parent: ProcessInfo.processInfo.environment,
+                                                    profileDirectory: directory),
+        workingDirectory: directory.appendingPathComponent("work", isDirectory: true))
+      session.onExit = { [weak self] status in
+        self?.completeClaudeLogin(accountID: accountID, profile: profile, status: status)
+      }
+      claudeLoginProfiles[accountID] = profile
+      claudeSessions[accountID] = session
+      claudeAccountMessages[accountID] = "Finish signing in in this account’s terminal."
+      claudeTerminalSession = session
+      reloadAccountStatuses()
+    } catch {
+      claudeAccountMessages[accountID] = claudeErrorMessage(error)
+      reloadAccountStatuses()
     }
   }
 
-  /// The freshest Claude access token available locally: file sources first (cheap, no
-  /// Keychain prompt), then the macOS Keychain that Claude Code keeps up to date.
-  private static func currentLocalClaudeToken() -> String? {
-    if let fileToken = CredentialDiscovery().discover().credentials
-      .first(where: { $0.provider == .anthropic })?
-      .credentials[CredentialField.anthropicAccessToken],
-      !fileToken.isEmpty
-    {
-      return fileToken
+  private func completeClaudeLogin(accountID: String, profile: ClaudeCodeProfile, status: Int32?) {
+    guard let account = account(withID: accountID), claudeLoginProfiles[accountID] == profile else { return }
+    claudeLoginProfiles[accountID] = nil
+    guard status == 0 else {
+      try? claudeProfiles.remove(profile)
+      claudeAccountMessages[accountID] = account.provider.hasRequiredCredentials(account.credentials)
+        ? "Sign-in did not finish. Your previous connection is unchanged."
+        : "Sign-in did not finish. Connect this account to try again."
+      reloadAccountStatuses()
+      return
     }
+    do {
+      let login = try claudeProfiles.read(profile, mode: .interactive)
+      let otherIdentities = providerAccounts.filter { $0.id != accountID && $0.provider == .anthropic }
+        .compactMap { ClaudeCodeProfile.identity(from: $0.credentials) }
+      let credentials = try ClaudeCodeProfile.loginCredentials(
+        for: account.credentials, credentials: login.credentials, identity: login.identity,
+        profileID: profile.id, existingIdentities: otherIdentities)
+      let previous = ClaudeCodeProfile.profile(from: account.credentials)
+      let retired = try ClaudeCodeProfileRetirement.commit(
+        stored: account.credentials,
+        refreshLocked: previous.map { claudeProfiles.isRefreshLocked($0) } ?? false,
+        retain: { try claudeProfiles.retain($0) },
+        commitAccountChange: { try persistClaudeCredentials(credentials, accountID: accountID) },
+        deleteProfile: { try claudeProfiles.remove($0) })
+      claudeCredentialFailures.remove(accountID)
+      claudeAccountMessages[accountID] = retired == .retained
+        ? "Connected. Previous login cleanup is pending; its credentials may still be stored on this Mac."
+        : "Connected. Credentials renew automatically."
+      reloadAccountStatuses()
+      let completedAt = Date()
+      Task { await refreshClaudeAccountAfterCurrentCycle(accountID, requestedAt: completedAt) }
+    } catch {
+      try? claudeProfiles.remove(profile)
+      claudeAccountMessages[accountID] = claudeErrorMessage(error)
+      reloadAccountStatuses()
+    }
+  }
 
-    #if canImport(Security)
-    return readClaudeKeychainToken().token
-    #else
-    return nil
-    #endif
+  /// Saving the pending marker must succeed before the CLI can rotate a grant.
+  /// On a crash or ambiguous exit, a later run may adopt a newly saved token, but
+  /// it must never replay the old refresh token automatically.
+  private func persistClaudeCredentials(_ credentials: [String: String], accountID: String,
+                                       expectedProfile: ClaudeCodeProfile? = nil) throws {
+    guard !configurationLoadFailed,
+          let index = providerAccounts.firstIndex(where: { $0.id == accountID }) else {
+      throw ClaudeProfileService.Failure.settingsUnavailable
+    }
+    if let expectedProfile,
+       ClaudeCodeProfile.profile(from: providerAccounts[index].credentials) != expectedProfile {
+      throw ClaudeProfileService.Failure.settingsUnavailable
+    }
+    let previous = providerAccounts[index].credentials
+    providerAccounts[index].credentials = credentials
+    do { try settingsStore.save(currentSettings()) }
+    catch {
+      providerAccounts[index].credentials = previous
+      throw ClaudeProfileService.Failure.settingsUnavailable
+    }
+    if syncSettingsToWidgetStore(currentSettings().redactedCredentials()) { reloadWidgetTimelines() }
+    reloadAccountStatuses()
+  }
+
+  private func prepareClaudeAccounts() async -> [ProviderFailure] {
+    let ids = providerAccounts.filter {
+      $0.provider == .anthropic && $0.isEnabled && ClaudeCodeProfile.profile(from: $0.credentials) != nil
+    }.map(\.id)
+    var failures: [ProviderFailure] = []
+    for id in ids {
+      if let failure = await prepareClaudeAccount(id: id) { failures.append(failure) }
+    }
+    return failures
+  }
+
+  private func prepareClaudeAccount(id: String, force: Bool = false) async -> ProviderFailure? {
+    guard let account = account(withID: id), account.isEnabled,
+          let profile = ClaudeCodeProfile.profile(from: account.credentials) else { return nil }
+    do {
+      if let operation = claudeRenewals[id] {
+        if case .running = await claudeProcess.status(id: operation) {
+          throw ClaudeCodeRenewalError.inProgress
+        }
+        claudeRenewals[id] = nil
+      }
+      guard !claudeAccountIsBusy(id), !claudeProfiles.isRefreshLocked(profile) else {
+        throw ClaudeCodeRenewalError.inProgress
+      }
+      _ = try await ClaudeCodeRenewal.prepare(
+        stored: account.credentials, force: force,
+        read: { [claudeProfiles] in
+          let login = try claudeProfiles.read(profile, mode: .background)
+          return ClaudeCodeLogin(credentials: login.credentials, identity: login.identity, renewal: login.renewal)
+        },
+        persist: { [weak self] credentials in
+          guard let self else { throw ClaudeProfileService.Failure.settingsUnavailable }
+          try await self.persistClaudeCredentials(credentials, accountID: id, expectedProfile: profile)
+        },
+        renew: { [weak self] material in
+          guard let self else { throw ClaudeProfileService.Failure.settingsUnavailable }
+          return try await self.renewClaudeAccount(id: id, profile: profile, material: material)
+        })
+      // A credential check resolves credential errors, not action notices such
+      // as a previous login whose cleanup is still pending after reconnect.
+      if claudeCredentialFailures.remove(id) != nil { claudeAccountMessages[id] = nil }
+      reloadAccountStatuses()
+      return nil
+    } catch {
+      let message = claudeErrorMessage(error)
+      claudeCredentialFailures.insert(id)
+      claudeAccountMessages[id] = message
+      reloadAccountStatuses()
+      return ProviderFailure(accountID: id, provider: .anthropic, kind: .auth, message: message)
+    }
+  }
+
+  private func renewClaudeAccount(id: String, profile: ClaudeCodeProfile,
+                                 material: ClaudeCodeRenewalMaterial) async throws -> Bool {
+    let directory = try claudeProfiles.prepare(profile)
+    let result = try await claudeProcess.run(
+      executable: claudeProfiles.executable(), arguments: ["auth", "login", "--claudeai"],
+      environment: ClaudeCodeProcess.environment(parent: ProcessInfo.processInfo.environment,
+                                                  profileDirectory: directory, renewal: material),
+      workingDirectory: directory.appendingPathComponent("work", isDirectory: true), timeout: 45)
+    switch result {
+    case .completed(let status):
+      guard status == 0 else { throw ClaudeCodeRenewalError.renewalIncomplete }
+      return true
+    case .running(let operation):
+      claudeRenewals[id] = operation
+      // Keep observing a slow child without killing it or replaying its grant.
+      Task { [weak self, claudeProcess] in
+        while case .running = await claudeProcess.status(id: operation) {
+          do { try await Task.sleep(for: .seconds(2)) }
+          catch { return }
+        }
+        guard let self, self.claudeRenewals[id] == operation else { return }
+        self.claudeRenewals[id] = nil
+        while self.isRefreshing {
+          do { try await Task.sleep(for: .seconds(1)) }
+          catch { return }
+        }
+        // A concurrent manual refresh may already have adopted and fetched it.
+        guard self.account(withID: id)?.credentials[CredentialField.anthropicRenewalPending] != nil else { return }
+        await self.refreshClaudeAccountAfterCurrentCycle(id, requestedAt: Date())
+      }
+      return false
+    }
+  }
+
+  private func claudeErrorMessage(_ error: Error) -> String {
+    // Process and filesystem errors can embed paths or command details. Only
+    // domain errors with fixed copy are allowed on snapshots and widgets.
+    if let error = error as? ClaudeProfileService.Failure { return error.localizedDescription }
+    if let error = error as? ClaudeCodeRenewalError { return error.localizedDescription }
+    if let error = error as? ClaudeCodeLoginError { return error.localizedDescription }
+    return "Could not connect this Claude account. Reconnect it to try again."
   }
 
   func account(withID accountID: String) -> ProviderAccount? {
@@ -655,7 +911,12 @@ final class AppModel: ObservableObject {
     Binding(
       get: { self.account(withID: accountID)?.credentials[fieldKey] ?? "" },
       set: { newValue in
+        self.claudeAccountMessages[accountID] = nil
+        self.claudeCredentialFailures.remove(accountID)
         self.updateAccount(accountID: accountID) { account in
+          if account.provider == .anthropic && fieldKey == CredentialField.anthropicAccessToken {
+            account.credentials = ClaudeCodeProfile.clearManagedMetadata(from: account.credentials)
+          }
           account.credentials[fieldKey] = newValue
         }
       }

@@ -160,9 +160,18 @@ private struct ClineAPI {
       throw Self.invalidResponse
     }
     let id = profile.id.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !id.isEmpty else { throw Self.invalidResponse }
+    guard Self.isPathSegment(id) else { throw Self.invalidResponse }
 
     return ClineProfile(id: id)
+  }
+
+  /// The user id becomes one path segment of the balance URL, and
+  /// `appendingPathComponent` leaves `/` intact, so an id carrying a separator
+  /// or a `..` would reshape the request instead of addressing the account.
+  /// Only the shape Cline actually issues is accepted.
+  private static func isPathSegment(_ id: String) -> Bool {
+    !id.isEmpty && !id.contains("/") && !id.contains("..") && !id.contains("?")
+      && id.rangeOfCharacter(from: .controlCharacters) == nil
   }
 
   func balance(apiKey: String, userID: String) async throws -> Double {

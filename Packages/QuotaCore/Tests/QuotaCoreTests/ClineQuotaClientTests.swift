@@ -212,6 +212,20 @@ final class ClineQuotaClientTests: XCTestCase {
     XCTAssertEqual(credit.remainingAmount, 0.000007)
   }
 
+    func testUserIDsThatCouldReshapeTheBalancePathAreRejected() async throws {
+    // The id is one path segment, and appending it must not become a different
+    // request than "this account's balance".
+    for id in ["usr/../admin", "usr-01/balance", "..", "usr-01?admin=1"] {
+      let body = #"{"success":true,"data":{"id":"\#(id)","email":"dev@example.com"}}"#
+      let http = ClineHTTPStub(.response(200, body))
+      await assertFailure(.decoding) {
+        try await ClineQuotaClient(httpClient: http).fetchUsage(configuration: self.configuration(), now: self.now)
+      }
+      let requests = await http.requests
+      XCTAssertEqual(requests.count, 1, "id \(id)")
+    }
+  }
+
   func testRejectedMissingAndMalformedAPIKeysBeforeNetworking() async {
     for key in [nil, "", " \n", "fixture key", "fixture\nkey", "fixture\u{0000}key"] as [String?] {
       let http = ClineHTTPStub(.response(200, profileBody))

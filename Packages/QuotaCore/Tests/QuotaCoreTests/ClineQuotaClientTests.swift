@@ -107,15 +107,23 @@ final class ClineQuotaClientTests: XCTestCase {
     }
   }
 
-  func testExhaustedCreditsAreWarnedOnlyWhenWindowsAreHealthy() async throws {
-    let idle = #"""
+  func testExhaustedCreditsAreWarnedOnlyWhenNoSubscriptionExists() async throws {
+    // A ClinePass subscriber who never bought credits is in a normal state;
+    // warning there would be permanent noise. Pay-as-you-go only, an empty
+    // balance does block work, so it is reported.
+    let subscribed = #"""
     {"success":true,"data":{"limits":[{"type":"five_hour","percentUsed":25},
                                       {"type":"weekly","percentUsed":10},{"type":"monthly","percentUsed":10}]}}
     """#
     let usage = try await fetch(balance: #"{"success":true,"data":{"userId":"\#(ClineQuotaClientTests.userID)","balance":0}}"#,
-                                limits: idle)
+                                limits: subscribed)
     XCTAssertEqual(usage.maxUsagePercent, 25)
-    XCTAssertEqual(usage.warning, "No Cline credits left")
+    XCTAssertNil(usage.warning)
+    XCTAssertEqual(usage.metrics.last?.usedDisplay, "$0.00", "The empty balance still shows as an amount")
+
+    let payAsYouGo = try await fetch(balance: #"{"success":true,"data":{"userId":"\#(ClineQuotaClientTests.userID)","balance":0}}"#,
+                                     limits: #"{"success":true,"data":null}"#)
+    XCTAssertEqual(payAsYouGo.warning, "No Cline credits left")
 
     let exhausted = limitsBody.replacingOccurrences(of: "\"percentUsed\":25", with: "\"percentUsed\":100")
     let spent = try await fetch(balance: #"{"success":true,"data":{"userId":"\#(ClineQuotaClientTests.userID)","balance":0}}"#,
@@ -164,13 +172,16 @@ final class ClineQuotaClientTests: XCTestCase {
     XCTAssertEqual(usage.metrics.map(\.id), ["credit-balance"])
   }
 
-  func testDuplicateWindowTypesCollapseToTheFirstReport() async throws {
+  func testDuplicateWindowTypesResolveToTheMostConsumedReading() async throws {
+    // The API never repeats a type; where it does, keeping the lower share
+    // would under-report usage.
     let limits = #"""
     {"success":true,"data":{"limits":[{"type":"weekly","percentUsed":10},{"type":"weekly","percentUsed":90}]}}
     """#
     let usage = try await fetch(limits: limits)
     XCTAssertEqual(usage.metrics.map(\.id), ["weekly", "credit-balance"])
-    XCTAssertEqual(usage.metrics[0].remainingPercent, 90)
+    XCTAssertEqual(usage.metrics[0].remainingPercent, 10)
+    XCTAssertEqual(usage.metrics[0].usedDisplay, "90% used")
   }
 
   func testWindowOrderFromTheServerDoesNotChangeRingSelection() async throws {
@@ -252,11 +263,36 @@ final class ClineQuotaClientTests: XCTestCase {
     }
   }
 
-  func testEnvelopeFailuresAreReportedAsAPIErrors() async {
-    for body in [#"{"success":false,"error":"Account suspended"}"#,
-                 #"{"success":false,"data":{"id":"usr-01FIXTURE"}}"#] {
+  func testEnvelopeFailuresAreReportedWithoutEchoingServerText() async {
+    // The server's `error` string reaches the snapshot and `llimit status`, so
+    // it is never echoed — a deployment reflecting the Authorization value
+    // back would otherwise put the key there.
+    let bodies = [
+      #"{"success":false,"error":"Invalid token: \(fixtureKey)"}"#,
+      #"{"success":false,"error":"Account suspended"}"#,
+      #"{"success":false,"data":{"id":"usr-01FIXTURE"}}"#
+    ]
+    for body in bodies {
       let http = ClineHTTPStub(.response(200, body))
-      await assertFailure(.api) {
+      do {
+        _ = try await ClineQuotaClient(httpClient: http).fetchUsage(configuration: configuration(), now: now)
+        XCTFail("Expected an API failure: \(body)")
+      } catch let error as ProviderClientError {
+        XCTAssertEqual(error.kind, .api, body)
+        XCTAssertFalse(error.message.contains(fixtureKey), body)
+        XCTAssertFalse(error.message.contains("suspended"), body)
+      } catch {
+        XCTFail("Expected a sanitized provider error: \(body)")
+      }
+    }
+  }
+
+  func testEnvelopeWithoutADataFieldFailsInsteadOfErasingWindows() async throws {
+    // Only an explicit `"data": null` means "no subscription". A missing key is
+    // a schema change, and must not silently drop the windows.
+    for body in [#"{"success":true}"#, #"{"success":true,"error":"nope"}"#] {
+      let http = ClineHTTPStub(.response(200, body))
+      await assertFailure(.decoding) {
         try await ClineQuotaClient(httpClient: http).fetchUsage(configuration: self.configuration(), now: self.now)
       }
     }

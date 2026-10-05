@@ -48,7 +48,10 @@ public struct ClineQuotaClient: QuotaProviderClient {
       warning = "ClinePass \(Self.windowName(exhausted.type)) limit reached"
     } else if let maxUsagePercent, maxUsagePercent >= Self.highUsagePercent {
       warning = "High ClinePass usage"
-    } else if balance <= 0 {
+    } else if windows.isEmpty, balance <= 0 {
+      // Only an account without a subscription depends on prepaid credits, so
+      // only there does an empty balance block work. Warning a ClinePass
+      // subscriber who never bought credits would be a permanent false alarm.
       warning = "No Cline credits left"
     } else {
       warning = nil
@@ -67,13 +70,26 @@ public struct ClineQuotaClient: QuotaProviderClient {
   /// `4250000` is $4.25.
   private static let creditsPerDollar = 1_000_000.0
 
-  /// The API repeats a type only in malformed responses, but keeping the first
-  /// share means the ring can never point at two rows for one window.
+  /// The API repeats a type only in malformed responses, so one type must not
+  /// produce two rows for the ring to choose between. Where two readings
+  /// disagree the more consumed one wins, because picking the other would
+  /// under-report usage.
   private static func deduplicated(_ windows: [ClineUsageWindow]) -> [ClineUsageWindow] {
-    var seen = Set<String>()
-    return windows.filter { window in
-      !window.type.isEmpty && seen.insert(window.type).inserted
+    var indexByType: [String: Int] = [:]
+    var result: [ClineUsageWindow] = []
+
+    for window in windows {
+      guard !window.type.isEmpty else { continue }
+
+      guard let index = indexByType[window.type] else {
+        indexByType[window.type] = result.count
+        result.append(window)
+        continue
+      }
+      if window.usedPercent > result[index].usedPercent { result[index] = window }
     }
+
+    return result
   }
 
   private static func windowMetric(_ window: ClineUsageWindow, now: Date) -> UsageMetric {
@@ -136,9 +152,6 @@ public struct ClineQuotaClient: QuotaProviderClient {
 /// `ProviderClientError`: no response body, and never the key, reaches a
 /// display surface.
 private struct ClineAPI {
-  /// Used when an envelope reports `success: false` without an error message.
-  static let unspecifiedFailure = "no reason reported"
-
   let baseURL: URL
   let httpClient: any HTTPClient
 
@@ -185,9 +198,16 @@ private struct ClineAPI {
   }
 
   /// The envelope's payload, or nil when the account simply has none.
+  ///
+  /// A rejected call reports fixed text only. The server's own `error` string
+  /// is not echoed: it lands in `ProviderFailure`, which is written to the
+  /// snapshot and rendered by `llimit status`, and a deployment that reflects
+  /// the submitted `Authorization` value back would put the key there.
   private static func payload<T>(_ envelope: ClineEnvelope<T>) throws -> T? {
-    guard let failure = envelope.failure else { return envelope.value }
-    throw ProviderClientError(kind: .api, message: "Cline rejected the usage request (\(failure)).")
+    guard !envelope.rejected else {
+      throw ProviderClientError(kind: .api, message: "Cline rejected the usage request. Try again later.")
+    }
+    return envelope.value
   }
 
   private func request(_ path: [String], apiKey: String) async throws -> (data: Data, statusCode: Int) {
@@ -234,7 +254,9 @@ private struct ClineAPI {
 /// marker is present, and carry `success: false` out as a typed failure.
 private struct ClineEnvelope<Value: Decodable>: Decodable {
   let value: Value?
-  let failure: String?
+  /// Whether the server reported the call itself as failed, independent of any
+  /// message it attached.
+  let rejected: Bool
 
   private enum CodingKeys: String, CodingKey {
     case success, error, data
@@ -244,22 +266,27 @@ private struct ClineEnvelope<Value: Decodable>: Decodable {
     guard let container = try? decoder.container(keyedBy: CodingKeys.self),
           let success = try? container.decodeIfPresent(Bool.self, forKey: .success) else {
       value = try Value(from: decoder)
-      failure = nil
+      rejected = false
       return
     }
 
     guard success else {
       value = nil
-      let reported = (try? container.decodeIfPresent(String.self, forKey: .error)).flatMap { $0 }
-      failure = reported.flatMap { $0.isEmpty ? nil : $0 } ?? ClineAPI.unspecifiedFailure
+      rejected = true
       return
     }
 
     // Only an explicit `"data": null` means "the account has none". A payload
-    // that fails to decode must propagate, or a schema change would silently
-    // erase the windows instead of surfacing as a refresh failure.
+    // that fails to decode, or a missing key, must propagate: a schema change
+    // would otherwise silently erase the windows the user already sees instead
+    // of surfacing as a refresh failure.
+    guard container.contains(.data) else {
+      throw DecodingError.dataCorrupted(.init(
+        codingPath: container.codingPath, debugDescription: "Envelope has no data field"
+      ))
+    }
     value = try container.decodeIfPresent(Value.self, forKey: .data)
-    failure = nil
+    rejected = false
   }
 }
 
@@ -290,17 +317,26 @@ private struct ClineUsageWindow: Decodable {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     type = (try container.decodeIfPresent(String.self, forKey: .type) ?? "")
       .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    percentUsed = try container.decodeIfPresent(Double.self, forKey: .percentUsed) ?? 0
+
+    let percentUsed = try container.decodeIfPresent(Double.self, forKey: .percentUsed) ?? 0
+    // Foundation differs on whether a share like `1e1000` throws or decodes as
+    // infinity, so reject it here to keep one behavior on every platform. A
+    // share is never legitimately unbounded.
+    guard percentUsed.isFinite else {
+      throw DecodingError.dataCorrupted(.init(
+        codingPath: container.codingPath + [CodingKeys.percentUsed],
+        debugDescription: "Window share is not a finite percentage"
+      ))
+    }
+    self.percentUsed = percentUsed
     resetsAt = try container.decodeIfPresent(String.self, forKey: .resetsAt)
   }
 
   /// The share as a whole percentage inside 0...100. The API reports a
-  /// percentage rather than an amount, so anything outside that range — or a
-  /// non-finite one — is clamped into the bounded geometry the surfaces draw
-  /// instead of propagating into a percentage.
+  /// percentage rather than an amount, so anything outside that range is
+  /// clamped into the bounded geometry the surfaces draw.
   var usedPercent: Int {
-    guard percentUsed.isFinite else { return 100 }
-    return Int(min(100, max(0, percentUsed)).rounded())
+    Int(min(100, max(0, percentUsed)).rounded())
   }
 
   var isExhausted: Bool { usedPercent >= 100 }
